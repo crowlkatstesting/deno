@@ -564,11 +564,21 @@ const NOT_IMPORTED_OPS = [
   "op_register_bench",
   "op_bench_get_origin",
 
-  // Related to `Deno.jupyter` API
-  "op_jupyter_broadcast",
-  "op_jupyter_input",
+  // Related to `Deno.jupyter` API and the in-tree Jupyter kernel.
   "op_jupyter_create_png_from_texture",
   "op_jupyter_get_buffer",
+  "op_jupyter_deno_version",
+  "op_jupyter_typescript_version",
+  "op_jupyter_recv",
+  "op_jupyter_send",
+  "op_jupyter_recv_stdio",
+  "op_jupyter_repl_evaluate",
+  "op_jupyter_repl_get_properties",
+  "op_jupyter_repl_global_lexical_scope_names",
+  "op_jupyter_repl_evaluate_expression",
+  "op_jupyter_repl_call_function_on_args",
+  "op_jupyter_repl_broadcast_result",
+  "op_jupyter_repl_cancel_terminate",
   // Used in jupyter API
   "op_base64_encode",
 

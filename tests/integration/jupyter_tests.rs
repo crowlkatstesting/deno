@@ -21,14 +21,14 @@ use test_util::test;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
-use zeromq::SocketRecv;
-use zeromq::SocketSend;
-use zeromq::ZmqMessage;
 
-/// Jupyter connection file format
+#[path = "jupyter_client.rs"]
+mod client;
+use client::ClientSocket;
+use client::ClientSocketType;
+
 #[derive(Serialize)]
 struct ConnectionSpec {
-  // key used for HMAC signature, if empty, hmac is not used
   key: String,
   signature_scheme: String,
   transport: String,
@@ -47,9 +47,6 @@ impl ConnectionSpec {
   }
 }
 
-/// Gets an unused port from the OS, and returns the port number and a
-/// `TcpListener` bound to that port. You can keep the listener alive
-/// to prevent another process from binding to the port.
 fn pick_unused_port() -> (u16, std::net::TcpListener) {
   let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
   (listener.local_addr().unwrap().port(), listener)
@@ -144,22 +141,22 @@ impl Default for MsgHeader {
 }
 
 impl JupyterMsg {
-  fn to_raw(&self) -> ZmqMessage {
+  fn to_parts(&self) -> Vec<Bytes> {
     let mut parts = Vec::new();
     parts.extend(
       self
         .routing_prefix
         .iter()
-        .map(|uuid| uuid.as_bytes().to_vec().into()),
+        .map(|uuid| Bytes::from(uuid.as_bytes().to_vec())),
     );
     parts.push(Bytes::from_static(DELIMITER));
-    parts.push(self.signature.clone().into());
-    parts.push(serde_json::to_vec(&self.header).unwrap().into());
-    parts.push(self.parent_header.to_string().into());
-    parts.push(self.metadata.to_string().into());
-    parts.push(self.content.to_string().into());
+    parts.push(Bytes::from(self.signature.clone().into_bytes()));
+    parts.push(Bytes::from(serde_json::to_vec(&self.header).unwrap()));
+    parts.push(Bytes::from(self.parent_header.to_string().into_bytes()));
+    parts.push(Bytes::from(self.metadata.to_string().into_bytes()));
+    parts.push(Bytes::from(self.content.to_string().into_bytes()));
     parts.extend(self.buffers.clone());
-    ZmqMessage::try_from(parts).unwrap()
+    parts
   }
 
   fn new(session: Uuid, msg_type: impl AsRef<str>, content: Value) -> Self {
@@ -174,9 +171,11 @@ impl JupyterMsg {
     }
   }
 
-  fn from_raw(msg: ZmqMessage) -> Self {
-    let parts = msg.into_vec();
-    let delimiter = parts.iter().position(|part| part == DELIMITER).unwrap();
+  fn from_parts(parts: Vec<Bytes>) -> Self {
+    let delimiter = parts
+      .iter()
+      .position(|part| part.as_ref() == DELIMITER)
+      .unwrap();
     let routing_prefix = parts[..delimiter]
       .iter()
       .map(|part: &Bytes| String::from_utf8_lossy(part.as_ref()).to_string())
@@ -189,7 +188,8 @@ impl JupyterMsg {
       serde_json::from_slice(&parts[delimiter + 3]).unwrap();
     let metadata: Value =
       serde_json::from_slice(&parts[delimiter + 4]).unwrap();
-    let content: Value = serde_json::from_slice(&parts[delimiter + 5]).unwrap();
+    let content: Value =
+      serde_json::from_slice(&parts[delimiter + 5]).unwrap();
     let buffers = parts[delimiter + 6..].to_vec();
     Self {
       routing_prefix,
@@ -203,32 +203,16 @@ impl JupyterMsg {
   }
 }
 
-async fn connect_socket<S: zeromq::Socket>(
-  spec: &ConnectionSpec,
-  port: u16,
-) -> S {
-  let addr = spec.endpoint(port);
-  let mut socket = S::new();
-  match timeout(Duration::from_millis(5000), socket.connect(&addr)).await {
-    Ok(Ok(_)) => socket,
-    Ok(Err(e)) => {
-      panic!("Failed to connect to {addr}: {e}");
-    }
-    Err(e) => {
-      panic!("Timed out connecting to {addr}: {e}");
-    }
-  }
-}
-
 #[derive(Clone)]
 struct JupyterClient {
   recv_timeout: Duration,
   session: Uuid,
-  heartbeat: Arc<Mutex<zeromq::ReqSocket>>,
-  control: Arc<Mutex<zeromq::DealerSocket>>,
-  shell: Arc<Mutex<zeromq::DealerSocket>>,
-  io_pub: Arc<Mutex<zeromq::SubSocket>>,
-  stdin: Arc<Mutex<zeromq::RouterSocket>>,
+  heartbeat: Arc<Mutex<ClientSocket>>,
+  control: Arc<Mutex<ClientSocket>>,
+  shell: Arc<Mutex<ClientSocket>>,
+  io_pub: Arc<Mutex<ClientSocket>>,
+  #[allow(dead_code, reason = "kept for parity with the legacy test client")]
+  stdin: Arc<Mutex<ClientSocket>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,12 +232,23 @@ impl JupyterClient {
   }
 
   async fn new_with_timeout(spec: &ConnectionSpec, timeout: Duration) -> Self {
+    let connect = |port, kind| {
+      let addr = spec.endpoint(port);
+      async move {
+        ClientSocket::connect(&addr, kind)
+          .await
+          .unwrap_or_else(|e| panic!("connect {addr}: {e}"))
+      }
+    };
     let (heartbeat, control, shell, io_pub, stdin) = tokio::join!(
-      connect_socket::<zeromq::ReqSocket>(spec, spec.hb_port),
-      connect_socket::<zeromq::DealerSocket>(spec, spec.control_port),
-      connect_socket::<zeromq::DealerSocket>(spec, spec.shell_port),
-      connect_socket::<zeromq::SubSocket>(spec, spec.iopub_port),
-      connect_socket::<zeromq::RouterSocket>(spec, spec.stdin_port),
+      connect(spec.hb_port, ClientSocketType::Req),
+      connect(spec.control_port, ClientSocketType::Dealer),
+      connect(spec.shell_port, ClientSocketType::Dealer),
+      connect(spec.iopub_port, ClientSocketType::Sub),
+      // Stdin from a frontend is normally DEALER; the legacy test used
+      // ROUTER but never sent on it. We use DEALER here for protocol
+      // correctness.
+      connect(spec.stdin_port, ClientSocketType::Dealer),
     );
 
     Self {
@@ -268,15 +263,12 @@ impl JupyterClient {
   }
 
   async fn io_subscribe(&self, topic: &str) -> Result<()> {
-    Ok(self.io_pub.lock().await.subscribe(topic).await?)
+    self.io_pub.lock().await.subscribe(topic).await
   }
 
-  async fn recv_with_timeout<S: SocketRecv>(
-    &self,
-    s: &mut S,
-  ) -> Result<JupyterMsg> {
-    let msg = timeout(self.recv_timeout, s.recv()).await??;
-    Ok(JupyterMsg::from_raw(msg))
+  async fn recv_with_timeout(&self, s: &mut ClientSocket) -> Result<JupyterMsg> {
+    let parts = timeout(self.recv_timeout, s.recv_multipart()).await??;
+    Ok(JupyterMsg::from_parts(parts))
   }
 
   async fn send_msg(
@@ -284,11 +276,11 @@ impl JupyterClient {
     channel: JupyterChannel,
     msg: JupyterMsg,
   ) -> Result<JupyterMsg> {
-    let raw = msg.to_raw();
+    let parts = msg.to_parts();
     match channel {
-      Control => self.control.lock().await.send(raw).await?,
-      Shell => self.shell.lock().await.send(raw).await?,
-      Stdin => self.stdin.lock().await.send(raw).await?,
+      Control => self.control.lock().await.send_multipart(parts).await?,
+      Shell => self.shell.lock().await.send_multipart(parts).await?,
+      Stdin => self.stdin.lock().await.send_multipart(parts).await?,
       IoPub => panic!("Cannot send over IOPub"),
     }
     Ok(msg)
@@ -306,47 +298,26 @@ impl JupyterClient {
 
   async fn recv(&self, channel: JupyterChannel) -> Result<JupyterMsg> {
     Ok(match channel {
-      Control => {
-        self
-          .recv_with_timeout(&mut *self.control.lock().await)
-          .await?
-      }
-      Shell => {
-        self
-          .recv_with_timeout(&mut *self.shell.lock().await)
-          .await?
-      }
-      Stdin => {
-        self
-          .recv_with_timeout(&mut *self.stdin.lock().await)
-          .await?
-      }
-      IoPub => {
-        self
-          .recv_with_timeout(&mut *self.io_pub.lock().await)
-          .await?
-      }
+      Control => self.recv_with_timeout(&mut *self.control.lock().await).await?,
+      Shell => self.recv_with_timeout(&mut *self.shell.lock().await).await?,
+      Stdin => self.recv_with_timeout(&mut *self.stdin.lock().await).await?,
+      IoPub => self.recv_with_timeout(&mut *self.io_pub.lock().await).await?,
     })
   }
 
   async fn send_heartbeat(&self, bytes: impl AsRef<[u8]>) -> Result<()> {
-    Ok(
-      self
-        .heartbeat
-        .lock()
-        .await
-        .send(ZmqMessage::from(bytes.as_ref().to_vec()))
-        .await?,
-    )
+    self
+      .heartbeat
+      .lock()
+      .await
+      .send_single(Bytes::from(bytes.as_ref().to_vec()))
+      .await
   }
 
   async fn recv_heartbeat(&self) -> Result<Bytes> {
-    Ok(
-      timeout(self.recv_timeout, self.heartbeat.lock().await.recv())
-        .await??
-        .into_vec()[0]
-        .clone(),
-    )
+    let mut hb = self.heartbeat.lock().await;
+    let parts = timeout(self.recv_timeout, hb.recv_multipart()).await??;
+    Ok(parts.into_iter().next().unwrap_or_default())
   }
 }
 
@@ -365,16 +336,9 @@ async fn wait_or_kill(
   Ok(process.wait_with_output()?)
 }
 
-// Wrapper around the Jupyter server process that
-// ensures the process is killed when dropped.
 struct JupyterServerProcess(Option<DenoChild>);
 
 impl JupyterServerProcess {
-  // Wait for the process to exit, or kill it after the given duration.
-  //
-  // Ideally we could use this at the end of each test, but the server
-  // doesn't seem to exit in a reasonable amount of time after getting
-  // a shutdown request.
   #[allow(dead_code, reason = "used in some tests")]
   async fn wait_or_kill(mut self, wait: Duration) -> Output {
     wait_or_kill(self.0.take().unwrap(), wait).await.unwrap()
@@ -387,7 +351,6 @@ impl Drop for JupyterServerProcess {
       return;
     };
     if proc.try_wait().unwrap().is_some() {
-      // already exited
       return;
     }
     proc.kill().unwrap();
@@ -440,31 +403,20 @@ async fn setup_server() -> (TestContext, ConnectionSpec, JupyterServerProcess) {
       .unwrap()
   };
 
-  // drop the listeners so the server can listen on the ports
   drop(listeners);
-
-  // try to start the server, retrying up to 5 times
-  // (this can happen due to TOCTOU errors with selecting unused TCP ports)
   let mut process = start_process(&conn_file);
 
   'outer: for i in 0..10 {
-    // try to see if the server is healthy
     for _ in 0..10 {
-      // server still running?
       if process.try_wait().unwrap().is_none() {
-        // listening on all ports?
         if server_ready(&conn).await {
-          // server is ready to go
           break 'outer;
         }
       } else {
-        // server exited, try again
         break;
       }
       tokio::time::sleep(Duration::from_millis(500)).await;
     }
-
-    // pick new ports and try again
     (conn, listeners) = ConnectionSpec::new();
     conn_file.write_json(&conn);
     drop(listeners);
@@ -481,10 +433,8 @@ async fn setup() -> (TestContext, JupyterClient, JupyterServerProcess) {
   let (context, conn, process) = setup_server().await;
   let client = JupyterClient::new(&conn).await;
   client.io_subscribe("").await.unwrap();
-  // make sure server is ready to receive messages
   client.send_heartbeat(b"ping").await.unwrap();
   let _ = client.recv_heartbeat().await.unwrap();
-
   (context, client, process)
 }
 
@@ -493,8 +443,7 @@ async fn jupyter_heartbeat_echoes() -> Result<()> {
   let (_ctx, client, _process) = setup().await;
   client.send_heartbeat(b"ping").await?;
   let msg = client.recv_heartbeat().await?;
-  assert_eq!(msg, Bytes::from_static(b"pong"));
-
+  assert_eq!(msg, Bytes::from_static(b"ping"));
   Ok(())
 }
 
@@ -520,7 +469,6 @@ async fn jupyter_kernel_info() -> Result<()> {
       },
     }),
   );
-
   Ok(())
 }
 
@@ -552,13 +500,11 @@ async fn jupyter_execute_request() -> Result<()> {
   );
 
   let mut msgs = Vec::new();
-
   for _ in 0..4 {
     match client.recv(IoPub).await {
       Ok(msg) => msgs.push(msg),
       Err(e) => {
         if e.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
-          // may timeout if we missed some messages
           eprintln!("Timed out waiting for messages");
         }
         panic!("Error: {:#?}", e);
@@ -569,32 +515,25 @@ async fn jupyter_execute_request() -> Result<()> {
   let execution_idle = msgs
     .iter()
     .find(|msg| {
-      if let Some(state) = msg.content.get("execution_state") {
-        state == "idle"
-      } else {
-        false
-      }
+      msg
+        .content
+        .get("execution_state")
+        .map(|s| s == "idle")
+        .unwrap_or(false)
     })
     .expect("execution_state idle not found");
   assert_eq!(execution_idle.parent_header, request.header.to_json());
-  assert_json_subset(
-    execution_idle.content.clone(),
-    json!({
-      "execution_state": "idle",
-    }),
-  );
 
   let execution_result = msgs
     .iter()
     .find(|msg| msg.header.msg_type == "stream")
     .expect("stream not found");
-  assert_eq!(execution_result.header.msg_type, "stream");
   assert_eq!(execution_result.parent_header, request.header.to_json());
   assert_json_subset(
     execution_result.content.clone(),
     json!({
       "name": "stdout",
-      "text": "asdf\n", // the trailing newline is added by console.log
+      "text": "asdf\n",
     }),
   );
 
@@ -633,28 +572,16 @@ async fn jupyter_store_history_false() -> Result<()> {
 async fn jupyter_shutdown_reply() -> Result<()> {
   let (_ctx, client, process) = setup().await;
   client
-    .send(
-      Control,
-      "shutdown_request",
-      json!({
-        "restart": false,
-      }),
-    )
+    .send(Control, "shutdown_request", json!({ "restart": false }))
     .await?;
   let msg = client.recv(Control).await?;
   assert_eq!(msg.header.msg_type, "shutdown_reply");
   assert_json_subset(
     msg.content,
-    json!({
-      "status": "ok",
-      "restart": false,
-    }),
+    json!({ "status": "ok", "restart": false }),
   );
-
-  // The kernel should exit after the shutdown request
   let output = process.wait_or_kill(Duration::from_secs(5)).await;
   assert!(output.status.success());
-
   Ok(())
 }
 
@@ -662,24 +589,14 @@ async fn jupyter_shutdown_reply() -> Result<()> {
 async fn jupyter_shutdown_restart_reply() -> Result<()> {
   let (_ctx, client, _process) = setup().await;
   client
-    .send(
-      Control,
-      "shutdown_request",
-      json!({
-        "restart": true,
-      }),
-    )
+    .send(Control, "shutdown_request", json!({ "restart": true }))
     .await?;
   let msg = client.recv(Control).await?;
   assert_eq!(msg.header.msg_type, "shutdown_reply");
   assert_json_subset(
     msg.content,
-    json!({
-      "status": "ok",
-      "restart": true,
-    }),
+    json!({ "status": "ok", "restart": true }),
   );
-
   Ok(())
 }
 
@@ -689,13 +606,7 @@ async fn jupyter_interrupt_reply() -> Result<()> {
   client.send(Control, "interrupt_request", json!({})).await?;
   let msg = client.recv(Control).await?;
   assert_eq!(msg.header.msg_type, "interrupt_reply");
-  assert_json_subset(
-    msg.content,
-    json!({
-      "status": "ok",
-    }),
-  );
-
+  assert_json_subset(msg.content, json!({ "status": "ok" }));
   Ok(())
 }
 
@@ -703,7 +614,6 @@ async fn jupyter_interrupt_reply() -> Result<()> {
 async fn jupyter_interrupt_running_code() -> Result<()> {
   let (_ctx, client, _process) = setup().await;
 
-  // Start an infinite loop
   client
     .send(
       Shell,
@@ -716,19 +626,14 @@ async fn jupyter_interrupt_running_code() -> Result<()> {
     )
     .await?;
 
-  // Give the code a moment to start executing
   tokio::time::sleep(Duration::from_millis(100)).await;
-
-  // Send interrupt request on the control channel
   client.send(Control, "interrupt_request", json!({})).await?;
   let interrupt_reply = client.recv(Control).await?;
   assert_eq!(interrupt_reply.header.msg_type, "interrupt_reply");
 
-  // The execute_request should complete (with an error due to interruption)
   let reply = client.recv(Shell).await?;
   assert_eq!(reply.header.msg_type, "execute_reply");
 
-  // Verify the kernel is still alive and can execute code after interrupt
   client
     .send(
       Shell,
@@ -742,12 +647,7 @@ async fn jupyter_interrupt_running_code() -> Result<()> {
     .await?;
   let reply = client.recv(Shell).await?;
   assert_eq!(reply.header.msg_type, "execute_reply");
-  assert_json_subset(
-    reply.content,
-    json!({
-      "status": "ok",
-    }),
-  );
+  assert_json_subset(reply.content, json!({ "status": "ok" }));
 
   Ok(())
 }
@@ -771,10 +671,7 @@ async fn jupyter_http_server() -> Result<()> {
   assert_eq!(reply.header.msg_type, "execute_reply");
   assert_json_subset(
     reply.content,
-    json!({
-      "status": "ok",
-      "execution_count": 0,
-    }),
+    json!({ "status": "ok", "execution_count": 0 }),
   );
 
   for _ in 0..3 {
@@ -782,6 +679,5 @@ async fn jupyter_http_server() -> Result<()> {
     let text: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(text, json!({ "hello": "world" }));
   }
-
   Ok(())
 }

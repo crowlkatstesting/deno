@@ -6,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use deno_core::anyhow::Context;
+use deno_core::anyhow::anyhow;
 use deno_core::anyhow::bail;
 use deno_core::error::AnyError;
 use deno_core::serde_json;
@@ -17,11 +18,47 @@ const DENO_ICON_32: &[u8] = include_bytes!("./resources/deno-logo-32x32.png");
 const DENO_ICON_64: &[u8] = include_bytes!("./resources/deno-logo-64x64.png");
 const DENO_ICON_SVG: &[u8] = include_bytes!("./resources/deno-logo-svg.svg");
 
+/// Jupyter's per-user data directory, following the same conventions as
+/// `jupyter --paths`:
+///
+/// * `$JUPYTER_DATA_DIR` if set
+/// * Linux: `$XDG_DATA_HOME/jupyter` (default `~/.local/share/jupyter`)
+/// * macOS: `~/Library/Jupyter`
+/// * Windows: `%APPDATA%\jupyter`
+fn jupyter_user_data_dir() -> Result<PathBuf, AnyError> {
+  if let Some(env_var) = std::env::var_os("JUPYTER_DATA_DIR") {
+    return Ok(PathBuf::from(env_var));
+  }
+  let home = std::env::var_os("HOME").map(PathBuf::from);
+
+  #[cfg(target_os = "macos")]
+  {
+    let home = home.ok_or_else(|| anyhow!("HOME not set"))?;
+    return Ok(home.join("Library").join("Jupyter"));
+  }
+
+  #[cfg(all(unix, not(target_os = "macos")))]
+  {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+      return Ok(PathBuf::from(xdg).join("jupyter"));
+    }
+    let home = home.ok_or_else(|| anyhow!("HOME not set"))?;
+    return Ok(home.join(".local").join("share").join("jupyter"));
+  }
+
+  #[cfg(windows)]
+  {
+    let appdata =
+      std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA not set"))?;
+    Ok(PathBuf::from(appdata).join("jupyter"))
+  }
+}
+
 fn get_user_data_dir() -> Result<PathBuf, AnyError> {
   Ok(if let Some(env_var) = std::env::var_os(TEST_ENV_VAR_NAME) {
     PathBuf::from(env_var)
   } else {
-    jupyter_runtime::dirs::user_data_dir()?
+    jupyter_user_data_dir()?
   })
 }
 

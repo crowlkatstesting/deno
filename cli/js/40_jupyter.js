@@ -434,13 +434,11 @@ async function formatInner(obj, raw) {
 internals.jupyter = { formatInner };
 
 function enableJupyter() {
-  const { op_jupyter_broadcast, op_jupyter_input } = core.ops;
-
   function input(
     prompt,
     password,
   ) {
-    return op_jupyter_input(prompt, password);
+    return internals.jupyter.kernelInput(prompt, password);
   }
 
   async function broadcast(
@@ -448,7 +446,10 @@ function enableJupyter() {
     content,
     { metadata = { __proto__: null }, buffers = [] } = { __proto__: null },
   ) {
-    await op_jupyter_broadcast(msgType, content, metadata, buffers);
+    await internals.jupyter.kernelBroadcast(msgType, content, {
+      metadata,
+      buffers,
+    });
   }
 
   async function broadcastResult(executionCount, result) {

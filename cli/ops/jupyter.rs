@@ -1,34 +1,119 @@
 // Copyright 2018-2026 the Deno authors. MIT license.
 
-// NOTE(bartlomieju): unfortunately it appears that clippy is broken
-// and can't allow a single line ignore for `await_holding_lock`.
-#![allow(clippy::await_holding_lock, reason = "clippy bug")]
+//! Ops backing the Jupyter kernel.
+//!
+//! The Jupyter protocol (HMAC signing, message dispatch, completion,
+//! `is_complete`, etc.) lives in JS at `cli/js/jupyter_kernel.js`. These ops
+//! provide the thin Rust surface the JS layer needs:
+//!
+//! * `op_jupyter_recv` / `op_jupyter_send` — bridge raw multipart frames to
+//!   the ZMTP sockets owned by `tools::jupyter::server`.
+//! * `op_jupyter_recv_stdio` — receive captured `console.log`/`stderr`
+//!   output that the `op_print` middleware buffers during user-code
+//!   evaluation.
+//! * `op_jupyter_repl_*` — drive the REPL session that runs user code, via
+//!   the existing `JupyterReplProxy` request/response channel pair.
+//! * `op_jupyter_create_png_from_texture` / `op_jupyter_get_buffer` —
+//!   unchanged display-data helpers.
+//! * `op_jupyter_deno_version` / `op_jupyter_typescript_version` —
+//!   convenience accessors used to populate `kernel_info_reply`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use deno_core::OpState;
-use deno_core::error::AnyError;
 use deno_core::op2;
-use deno_core::parking_lot::Mutex;
+use deno_core::serde::Deserialize;
 use deno_core::serde_json;
+use deno_core::serde_v8;
 use deno_error::JsErrorBox;
-use jupyter_protocol::InputRequest;
-use jupyter_protocol::JupyterMessage;
-use jupyter_protocol::JupyterMessageContent;
-use jupyter_protocol::StreamContent;
-use jupyter_runtime::KernelIoPubConnection;
+use deno_lib::version::DENO_VERSION_INFO;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 
-use crate::tools::jupyter::server::StdinConnectionProxy;
+use crate::cdp;
+use crate::tools::jupyter::JupyterReplProxy;
+use crate::tools::jupyter::JupyterReplRequest;
+use crate::tools::jupyter::JupyterReplResponse;
+use crate::tools::jupyter::server::ChannelHandle;
+use crate::tools::jupyter::server::SocketHandles;
+
+/// Captured chunk of user-code output.
+#[derive(Debug, Clone)]
+pub struct StreamContent {
+  pub name: &'static str,
+  pub text: String,
+}
+
+impl StreamContent {
+  pub fn stdout(s: &str) -> Self {
+    Self {
+      name: "stdout",
+      text: s.to_string(),
+    }
+  }
+  pub fn stderr(s: &str) -> Self {
+    Self {
+      name: "stderr",
+      text: s.to_string(),
+    }
+  }
+}
+
+/// Per-channel send/receive handles, stored in the op state so async ops
+/// can pull from / push to them.
+pub struct JupyterSockets {
+  pub heartbeat: ChannelState,
+  pub control: ChannelState,
+  pub shell: ChannelState,
+  pub stdin: ChannelState,
+  pub iopub: ChannelState,
+}
+
+pub struct ChannelState {
+  pub recv: Arc<AsyncMutex<mpsc::UnboundedReceiver<Vec<Bytes>>>>,
+  pub send: mpsc::UnboundedSender<Vec<Bytes>>,
+}
+
+impl ChannelState {
+  fn from_handle(h: ChannelHandle) -> Self {
+    Self {
+      recv: Arc::new(AsyncMutex::new(h.incoming_rx)),
+      send: h.outgoing_tx,
+    }
+  }
+}
+
+impl From<SocketHandles> for JupyterSockets {
+  fn from(h: SocketHandles) -> Self {
+    Self {
+      heartbeat: ChannelState::from_handle(h.heartbeat),
+      control: ChannelState::from_handle(h.control),
+      shell: ChannelState::from_handle(h.shell),
+      stdin: ChannelState::from_handle(h.stdin),
+      iopub: ChannelState::from_handle(h.iopub),
+    }
+  }
+}
 
 deno_core::extension!(deno_jupyter,
   ops = [
-    op_jupyter_broadcast,
-    op_jupyter_input,
+    op_jupyter_recv,
+    op_jupyter_send,
+    op_jupyter_recv_stdio,
+    op_jupyter_repl_evaluate,
+    op_jupyter_repl_get_properties,
+    op_jupyter_repl_global_lexical_scope_names,
+    op_jupyter_repl_evaluate_expression,
+    op_jupyter_repl_call_function_on_args,
+    op_jupyter_repl_broadcast_result,
+    op_jupyter_repl_cancel_terminate,
     op_jupyter_create_png_from_texture,
     op_jupyter_get_buffer,
+    op_jupyter_deno_version,
+    op_jupyter_typescript_version,
   ],
   options = {
     sender: mpsc::UnboundedSender<StreamContent>,
@@ -44,8 +129,6 @@ deno_core::extension!(deno_jupyter,
 
 deno_core::extension!(deno_jupyter_for_test,
   ops = [
-    op_jupyter_broadcast,
-    op_jupyter_input,
     op_jupyter_create_png_from_texture,
     op_jupyter_get_buffer,
   ],
@@ -57,132 +140,241 @@ deno_core::extension!(deno_jupyter_for_test,
   },
 );
 
-#[op2]
-#[string]
-pub fn op_jupyter_input(
-  state: &mut OpState,
-  #[string] prompt: String,
-  is_password: bool,
-) -> Option<String> {
-  let (last_execution_request, stdin_connection_proxy) = {
-    (
-      state.borrow::<Arc<Mutex<Option<JupyterMessage>>>>().clone(),
-      state.borrow::<Arc<Mutex<StdinConnectionProxy>>>().clone(),
-    )
+#[op2(fast)]
+pub fn op_print(state: &mut OpState, #[string] msg: &str, is_err: bool) {
+  let sender = state.borrow_mut::<mpsc::UnboundedSender<StreamContent>>();
+  let item = if is_err {
+    StreamContent::stderr(msg)
+  } else {
+    StreamContent::stdout(msg)
   };
-
-  let maybe_last_request = last_execution_request.lock().clone();
-  if let Some(last_request) = maybe_last_request {
-    let JupyterMessageContent::ExecuteRequest(msg) = &last_request.content
-    else {
-      return None;
-    };
-
-    if !msg.allow_stdin {
-      return None;
-    }
-
-    let content = InputRequest {
-      prompt,
-      password: is_password,
-    };
-
-    let msg = JupyterMessage::new(content, Some(&last_request));
-
-    let Ok(()) = stdin_connection_proxy.lock().tx.send(msg) else {
-      return None;
-    };
-
-    // Need to spawn a separate thread here, because `blocking_recv()` can't
-    // be used from the Tokio runtime context.
-    let join_handle = std::thread::spawn(move || {
-      stdin_connection_proxy.lock().rx.blocking_recv()
-    });
-    let Ok(Some(response)) = join_handle.join() else {
-      return None;
-    };
-
-    let JupyterMessageContent::InputReply(msg) = response.content else {
-      return None;
-    };
-
-    return Some(msg.value);
+  if let Err(err) = sender.send(item) {
+    log::error!("Failed to send stdio chunk: {}", err);
   }
-
-  None
 }
 
-#[derive(Debug, thiserror::Error, deno_error::JsError)]
-pub enum JupyterBroadcastError {
-  #[class(inherit)]
-  #[error(transparent)]
-  SerdeJson(serde_json::Error),
-  #[class(generic)]
-  #[error(transparent)]
-  ZeroMq(AnyError),
+fn pick_channel<'a>(
+  sockets: &'a JupyterSockets,
+  name: &str,
+) -> Option<&'a ChannelState> {
+  match name {
+    "heartbeat" => Some(&sockets.heartbeat),
+    "control" => Some(&sockets.control),
+    "shell" => Some(&sockets.shell),
+    "stdin" => Some(&sockets.stdin),
+    "iopub" => Some(&sockets.iopub),
+    _ => None,
+  }
 }
 
 #[op2]
-pub async fn op_jupyter_broadcast(
+#[serde]
+pub async fn op_jupyter_recv(
   state: Rc<RefCell<OpState>>,
-  #[string] message_type: String,
-  #[serde] content: serde_json::Value,
-  #[serde] metadata: serde_json::Value,
-  #[serde] buffers: Vec<deno_core::JsBuffer>,
-) -> Result<(), JupyterBroadcastError> {
-  let (iopub_connection, last_execution_request) = {
+  #[string] channel: String,
+) -> Result<Option<Vec<serde_v8::ToJsBuffer>>, JsErrorBox> {
+  let recv = {
     let s = state.borrow();
-
-    (
-      s.borrow::<Arc<Mutex<KernelIoPubConnection>>>().clone(),
-      s.borrow::<Arc<Mutex<Option<JupyterMessage>>>>().clone(),
-    )
-  };
-
-  let maybe_last_request = last_execution_request.lock().clone();
-  if let Some(last_request) = maybe_last_request {
-    let content = JupyterMessageContent::from_type_and_content(
-      &message_type,
-      content.clone(),
-    )
-    .map_err(|err| {
-      log::error!(
-          "Error deserializing content from jupyter.broadcast, message_type: {}:\n\n{}\n\n{}",
-          &message_type,
-          content,
-          err
-      );
-      JupyterBroadcastError::SerdeJson(err)
+    let sockets = s.borrow::<Arc<JupyterSockets>>();
+    let ch = pick_channel(sockets, &channel).ok_or_else(|| {
+      JsErrorBox::type_error(format!("unknown channel {channel}"))
     })?;
+    ch.recv.clone()
+  };
+  let mut guard = recv.lock().await;
+  let Some(parts) = guard.recv().await else {
+    return Ok(None);
+  };
+  Ok(Some(
+    parts
+      .into_iter()
+      .map(|b| serde_v8::ToJsBuffer::from(b.to_vec()))
+      .collect(),
+  ))
+}
 
-    let jupyter_message = JupyterMessage::new(content, Some(&last_request))
-      .with_metadata(metadata)
-      .with_buffers(buffers.into_iter().map(|b| b.to_vec().into()).collect());
+#[op2]
+pub fn op_jupyter_send(
+  state: &mut OpState,
+  #[string] channel: String,
+  #[serde] parts: Vec<serde_v8::JsBuffer>,
+) -> Result<(), JsErrorBox> {
+  let sockets = state.borrow::<Arc<JupyterSockets>>();
+  let ch = pick_channel(sockets, &channel).ok_or_else(|| {
+    JsErrorBox::type_error(format!("unknown channel {channel}"))
+  })?;
+  let bytes: Vec<Bytes> =
+    parts.into_iter().map(|b| Bytes::from(b.to_vec())).collect();
+  ch.send
+    .send(bytes)
+    .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+  Ok(())
+}
 
-    iopub_connection
-      .lock()
-      .send(jupyter_message)
-      .await
-      .map_err(|e| JupyterBroadcastError::ZeroMq(e.into()))?;
+#[op2]
+#[serde]
+pub async fn op_jupyter_recv_stdio(
+  state: Rc<RefCell<OpState>>,
+) -> Option<(String, String)> {
+  let recv = {
+    let s = state.borrow();
+    s.borrow::<Arc<AsyncMutex<mpsc::UnboundedReceiver<StreamContent>>>>()
+      .clone()
+  };
+  let mut guard = recv.lock().await;
+  let item = guard.recv().await?;
+  Some((item.name.to_string(), item.text))
+}
+
+#[op2]
+#[serde]
+pub async fn op_jupyter_repl_evaluate(
+  state: Rc<RefCell<OpState>>,
+  #[string] code: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+  let proxy = repl_proxy(&state);
+  let mut p = proxy.lock().await;
+  let _ = p
+    .tx
+    .send(JupyterReplRequest::EvaluateLineWithObjectWrapping { line: code });
+  let Some(JupyterReplResponse::EvaluateLineWithObjectWrapping(resp)) =
+    p.rx.recv().await
+  else {
+    return Err(JsErrorBox::generic("REPL bridge closed"));
+  };
+  match resp {
+    Ok(r) => Ok(serde_json::to_value(r.value).map_err(|e| {
+      JsErrorBox::generic(format!("serialize EvaluateResponse: {e}"))
+    })?),
+    Err(e) => Err(JsErrorBox::generic(e.to_string())),
   }
+}
 
+#[op2]
+#[serde]
+pub async fn op_jupyter_repl_get_properties(
+  state: Rc<RefCell<OpState>>,
+  #[string] object_id: String,
+) -> Option<serde_json::Value> {
+  let proxy = repl_proxy(&state);
+  let mut p = proxy.lock().await;
+  let _ = p.tx.send(JupyterReplRequest::GetProperties { object_id });
+  let Some(JupyterReplResponse::GetProperties(resp)) = p.rx.recv().await else {
+    return None;
+  };
+  resp.and_then(|r| serde_json::to_value(r).ok())
+}
+
+#[op2]
+#[serde]
+pub async fn op_jupyter_repl_global_lexical_scope_names(
+  state: Rc<RefCell<OpState>>,
+) -> Vec<String> {
+  let proxy = repl_proxy(&state);
+  let mut p = proxy.lock().await;
+  let _ = p.tx.send(JupyterReplRequest::GlobalLexicalScopeNames);
+  let Some(JupyterReplResponse::GlobalLexicalScopeNames(resp)) =
+    p.rx.recv().await
+  else {
+    return vec![];
+  };
+  resp.names
+}
+
+#[op2]
+#[serde]
+pub async fn op_jupyter_repl_evaluate_expression(
+  state: Rc<RefCell<OpState>>,
+  #[string] expr: String,
+) -> Option<serde_json::Value> {
+  let proxy = repl_proxy(&state);
+  let mut p = proxy.lock().await;
+  let _ = p.tx.send(JupyterReplRequest::Evaluate { expr });
+  let Some(JupyterReplResponse::Evaluate(resp)) = p.rx.recv().await else {
+    return None;
+  };
+  resp.and_then(|r| serde_json::to_value(r).ok())
+}
+
+#[derive(Deserialize)]
+struct CallFunctionOnArgsParams {
+  #[serde(rename = "functionDeclaration")]
+  function_declaration: String,
+  arguments: Vec<cdp::RemoteObject>,
+}
+
+#[op2]
+#[serde]
+pub async fn op_jupyter_repl_call_function_on_args(
+  state: Rc<RefCell<OpState>>,
+  #[serde] params: CallFunctionOnArgsParams,
+) -> Result<serde_json::Value, JsErrorBox> {
+  let proxy = repl_proxy(&state);
+  let mut p = proxy.lock().await;
+  let _ = p.tx.send(JupyterReplRequest::CallFunctionOnArgs {
+    function_declaration: params.function_declaration,
+    args: params.arguments,
+  });
+  let Some(JupyterReplResponse::CallFunctionOnArgs(resp)) = p.rx.recv().await
+  else {
+    return Err(JsErrorBox::generic("REPL bridge closed"));
+  };
+  let r = resp.map_err(|e| JsErrorBox::generic(e.to_string()))?;
+  serde_json::to_value(r).map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+#[op2]
+pub async fn op_jupyter_repl_broadcast_result(
+  state: Rc<RefCell<OpState>>,
+  #[smi] execution_count: u32,
+  #[serde] result: cdp::CallArgument,
+) -> Result<(), JsErrorBox> {
+  let count = cdp::CallArgument {
+    value: Some(serde_json::Value::from(execution_count)),
+    unserializable_value: None,
+    object_id: None,
+  };
+  let proxy = repl_proxy(&state);
+  let mut p = proxy.lock().await;
+  let _ = p.tx.send(JupyterReplRequest::CallFunctionOn {
+    arg0: count,
+    arg1: result,
+  });
+  let Some(JupyterReplResponse::CallFunctionOn(_)) = p.rx.recv().await else {
+    return Err(JsErrorBox::generic("REPL bridge closed"));
+  };
   Ok(())
 }
 
 #[op2(fast)]
-pub fn op_print(state: &mut OpState, #[string] msg: &str, is_err: bool) {
-  let sender = state.borrow_mut::<mpsc::UnboundedSender<StreamContent>>();
-
-  if is_err {
-    if let Err(err) = sender.send(StreamContent::stderr(msg)) {
-      log::error!("Failed to send stderr message: {}", err);
-    }
-    return;
+pub fn op_jupyter_repl_cancel_terminate(state: &mut OpState) {
+  let proxy = state.borrow::<Arc<AsyncMutex<JupyterReplProxy>>>().clone();
+  // Best-effort: try_lock so we don't await here. The cancel just flips
+  // a flag on the isolate.
+  if let Ok(p) = proxy.try_lock() {
+    let _ = p.tx.send(JupyterReplRequest::CancelPendingTerminate);
   }
+}
 
-  if let Err(err) = sender.send(StreamContent::stdout(msg)) {
-    log::error!("Failed to send stdout message: {}", err);
-  }
+#[op2]
+#[string]
+pub fn op_jupyter_deno_version() -> String {
+  DENO_VERSION_INFO.deno.to_string()
+}
+
+#[op2]
+#[string]
+pub fn op_jupyter_typescript_version() -> String {
+  DENO_VERSION_INFO.typescript.to_string()
+}
+
+fn repl_proxy(
+  state: &Rc<RefCell<OpState>>,
+) -> Arc<AsyncMutex<JupyterReplProxy>> {
+  state
+    .borrow()
+    .borrow::<Arc<AsyncMutex<JupyterReplProxy>>>()
+    .clone()
 }
 
 #[op2]
@@ -232,13 +424,11 @@ pub fn op_jupyter_create_png_from_texture(
   };
 
   let mut out: Vec<u8> = vec![];
-
   let img =
     deno_runtime::deno_image::image::codecs::png::PngEncoder::new(&mut out);
   img
     .write_image(&data, texture.size.width, texture.size.height, color_type)
     .map_err(|e| JsErrorBox::type_error(e.to_string()))?;
-
   Ok(deno_runtime::deno_web::forgiving_base64_encode(&out))
 }
 
@@ -278,11 +468,9 @@ pub fn op_jupyter_get_buffer(
     let slice = unsafe {
       std::slice::from_raw_parts(slice_pointer.as_ptr(), range_size as usize)
     };
-
     slice.to_vec()
   };
 
   buffer.instance.buffer_unmap(buffer.id)?;
-
   Ok(data)
 }
